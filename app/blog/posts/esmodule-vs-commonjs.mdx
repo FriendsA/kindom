@@ -1,0 +1,155 @@
+---
+title: '前端模块体系'
+publishedAt: '2025-07-31'
+summary: '前端commonjs模块和module模块的区别'
+---
+
+现在前端的模块主要分为commonjs和module模块，commonjs是社区制定的方案，主要使用在nodejs等服务端，不能直接在浏览器环境中使用。module模块是ES6提供的模块方案，可以在浏览器环境中直接使用。（vite的dev模式就是利用了module模块可以直接使用在浏览器中的特性）
+
+## Module
+
+ES6模块不是对象，不用引用ES6模块本身。
+
+静态化 可以在*编译期*确定模块依赖关系（用来tree shake）
+
+模块内自动开启严格模式
+
+### export和import
+
+export语句输出的接口与其对应的值是**动态绑定关系**
+
+export可以出现在模块的任何位置但是必须是模块顶层（因为在条件代码块内就没法做静态优化了）
+
+import输出的变量都是只读的（不可以改写导出对象，但是可以改写导出对象的属性，但是不建议用，因为是动态的）
+
+import命令具有提升效果可以写在使用的后面
+
+import语句不支持表达式和变量或者if结构
+
+```ts
+/** 
+ * ES2020 提出了支持动态加载模块 运行时执行·
+ * 可以使用在任何地方不必是顶层，甚至可以是非模块的脚本 相当于require的异步加载 可以使用在CommonJs的模块中
+ */
+const path = 'xxx'
+import(`./${path}`).then(module=>console.log(module));
+```
+
+import会执行所加载的模块，重复写也只会执行一次
+
+export喝import的混合写法当前模块不能使用中转导出的代码
+
+### import.meta
+
+获取当前模块的元信息，只能在模块内部使用
+
+import.meta.url 返回当前模块的URL路径 (在node环境中是file协议的本地路径)
+
+import.meta.scriptElement 浏览器特有元属性，返回加载模块的那个\<script\>元素相当于document.currentScript
+
+```ts
+export { foo } from 'xxx';
+console.log(foo); // 会报错
+```
+
+### 浏览器加载
+
+script脚本正常情况下是下载然后执行，会阻塞dom渲染。
+
+如果使用了defer关键字会异步下载然后在所有dom渲染完毕所有脚本执行好之后执行。多个defer脚本**按照先后顺序**再执行。
+
+如果使用了async关键字会异步下载并在下载完成后立刻执行，多个async脚本不能保证先后顺序。
+
+```html
+<!-- 相当于使用了defer的普通script脚本，也可以使用async -->
+<script type="module" src="xxx" ></script>
+
+<!-- 也可以内嵌,但是内嵌部分是模块作用域 -->
+<script type="module">
+  import { foo } from 'xxx';
+  console.log(foo);
+</script>
+```
+
+## CommonJS
+
+导出的是module.exports对象 只有在运行完脚本才生成
+
+非静待化 只能在**运行时**确定模块依赖关系
+
+导出的是**值的缓存**
+
+可以出现在任何位置
+
+## ES6模块和CommonJS模块的差异
+
+- CommonJS模块输出的是**值的拷贝**，ES6模块输出的是**值的引用**
+- CommonJS模块是**运行时**加载，ES6模块是**编译时**输出接口 
+- CommonJS模块的**require()**是同步加载模块，ES6模块的import命令是异步加载，有一个独立的模块依赖的解析阶段
+
+## node模块的加载方法
+
+### 加载入口
+
+```json5 
+
+{
+  /** 声明脚本的格式，如果声明了module则使用commonjs脚本时要用.cjs尾缀，反之使用.mjs尾缀 */
+  "type": "module" 
+  /** 定义脚本的入口文件 */
+  "main":"xxx/index.js"
+  /** 优先级高于main 可以指定子目录或者脚本 */
+  "exports": {
+    /** 代表主目录 */
+    ".":"xxx/index.js"
+    "./submodule": "xxx/submodule/index.js"
+
+
+    /** 可以用别名为ES6模块和CommonJs模块指定不同的入口 */
+    ".": {
+      "require": "xxx/main.cjs",
+      "default": "xxx/main.js"
+    }
+    /** 可以简写成，但是不能有其他别名 */
+    "require": "xxx/main.cjs",
+    "default":"./main.js"
+  }
+
+}
+
+```
+
+### 循环加载
+
+#### CommonJS 模块的加载原理
+
+require命令第一次加载脚本会执行整个脚本，在内存生成一个对象
+
+```ts
+
+{
+  id:"",
+  /** 绝对路径 */
+  fileName:""
+  path:"",
+  exports:{},
+  loaded: false,
+  require: function(){}
+  parent: Module
+  children:[],
+  path:[]
+}
+
+```
+
+只会在第一次加载时运行一次，之后再加载返回第一次的运行结果，除非手动清除系统缓存。
+
+#### CommonJS 模块的循环加载
+
+执行到哪里就直接使用执行部分的exports
+
+#### ES6模块的循环加载
+
+会先做静态分析先执行引用的模块，如果执行到使用的变量不存在则报错
+
+
