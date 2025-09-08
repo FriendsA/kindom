@@ -1,0 +1,475 @@
+---
+title: '大文件分片上传和断点续传'
+publishedAt: '2025-09-08'
+summary: '超大文件的分片上传和断点续传'
+---
+
+起初只是理论上了解大文件分片上传和断点续传的原理，但是没有实际项目中使用，所以一直没有去实现。上周在微信上看到一篇文章 [实现大文件上传全流程详解(补偿版本)](https://mp.weixin.qq.com/s/SvQ5hnf__b7wfmugsi3MxA),文中是使用vue+express实现的，正好最近了解到Hono框架就参考了思路实现了一个react+hono版本的例子。
+
+原文中的并发部分的中断处理应该是有问题的，所以自己又实现了一下请求并发的部分。
+
+基本思路：
+
+1. 文件使用hash分片，hash使用截取部分生成的方式优化计算时间。
+2. 后端使用hash路径存储，根据hash路径判断文件是否存在。
+3. 前端上传之前先通过接口检查文件是否存在，存在部分路径只要得到未上传部分的hash上传即可。
+
+原理是比较简单的，就是处理文件存储部分需要使用buffer和arrayBuffer比较不常用，这次实践一次下次自己处理文件就有经验了。
+
+## 前端代码
+
+spark-md5是个计算文件hash的库，使用起来比较简单。
+
+```ts
+import { useState } from "react";
+import sparkMD5 from "spark-md5";
+
+/** 分片大小 */
+const CHUNK_SIZE = 1024 * 1024;
+/** 最大并发请求 */
+const MAX_CONCURRENT = 6;
+let abortFlag = false;
+let abortControllers: AbortController[] = [];
+/** 服务地址 */
+const base_url = 'http://localhost:3003';
+
+/**
+ * 文件chunks计算Hash,中间取样加速计算时间
+ * @param chunks 文件生成chunks
+ * @returns 计算的MD5 Hash
+ */
+const calculateHash = (chunks: Blob[]): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    try {
+      const spark = new sparkMD5.ArrayBuffer();
+      const fileReader = new FileReader();
+      const targets: Blob[] = [];
+
+      chunks.forEach((chunk, index) => {
+        if (index === 0 || index === chunks.length - 1) {
+          targets.push(chunk);
+        } else {
+          targets.push(chunk.slice(0, 2));
+          targets.push(chunk.slice(CHUNK_SIZE / 2, CHUNK_SIZE / 2 + 2));
+          targets.push(chunk.slice(-2));
+        }
+      });
+
+      fileReader.readAsArrayBuffer(new Blob(targets));
+      fileReader.onload = (e) => {
+        spark.append(e.target?.result as ArrayBuffer);
+        resolve(spark.end());
+      };
+    } catch (error) {
+      reject(error);
+    }
+  });
+};
+
+/**
+ * file创建chunks
+ * @param file 上传的文件
+ * @returns file分割的chunks
+ */
+const createChunks = (file: File) => {
+  let cur = 0;
+  const chunks: Blob[] = [];
+  while (cur < file.size) {
+    const blob = file.slice(cur, cur + CHUNK_SIZE);
+    chunks.push(blob);
+    cur += CHUNK_SIZE;
+  }
+  return chunks;
+};
+
+/**
+ * 验证文件完整性
+ * @param fileHash 文件的Hash
+ * @param fileName 文件名称
+ * @returns 文件验证信息
+ */
+const verify = async (
+  fileHash: string,
+  fileName: string
+): Promise<{
+  data: {
+    shouldUpload: boolean;
+    existChunks: string[];
+  };
+}> => {
+  const res = await fetch("http://localhost:3003/api/verify", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      fileHash: fileHash,
+      fileName: fileName,
+    }),
+  });
+  return res.json();
+};
+
+/**
+ * 请求合并文件
+ * @param fileHash 文件的Hash
+ * @param fileName 文件名称
+ */
+const mergeRequest = async (fileHash: string, fileName: string) => {
+  await fetch(`${base_url}/api/merge`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      fileHash,
+      fileName,
+      size: CHUNK_SIZE,
+    }),
+  });
+};
+
+interface UploadChunkResponse {
+  status: number;
+  message: string;
+}
+
+/**
+ * 并发控制上传
+ * TODO: 写的不对，不能中断
+ * @param formDataList 文件chunks数据
+ */
+const uploadWithConcurrencyControl = async (formDataList: FormData[]) => {
+  const tasks = formDataList.map((i) => () => {
+    const controller = new AbortController();
+    abortControllers.push(controller);
+    return fetch(`${base_url}/api/upload`, {
+      method: "POST",
+      body: i,
+      signal: controller.signal,
+    })
+      .then((res) => res.json())
+      .catch((err) => {
+        if (err.name !== "AbortError") {
+          console.error("分片上传失败：", err);
+          throw new Error("xxx");
+        }
+      });
+  });
+
+  let index = 0;
+  const result: Promise<UploadChunkResponse>[] = [];
+  const executing: Promise<any>[] = [];
+
+  const execute = () => {
+    if (index >= tasks.length) {
+      return Promise.resolve();
+    }
+
+    if (abortFlag) {
+      return Promise.resolve();
+    }
+
+    const p = tasks[index++];
+    const promise = Promise.resolve().then(() => p());
+    result.push(promise);
+
+    const remove = () => {
+      const i = executing.indexOf(promise);
+      if (i !== -1) {
+        executing.splice(i, 1);
+      }
+    };
+
+    const handler = (): Promise<any> => {
+      remove();
+      return execute();
+    };
+
+    const promiseWrapper = promise.then(handler, handler);
+    executing.push(promiseWrapper);
+    return promiseWrapper;
+  };
+
+  const allPromise = [];
+  while (allPromise.length < MAX_CONCURRENT && index < tasks.length) {
+    allPromise.push(execute());
+  }
+  return Promise.all(allPromise).then(() => Promise.all(result));
+};
+
+interface UploadChunksProps {
+  /** 文件chunks */
+  chunks: Blob[];
+  /** 已上传的chunks */
+  existChunks: string[];
+  /** 文件 MD5 Hash */
+  fileHash: string;
+  /** 文件名称 */
+  fileName: string;
+}
+
+/**
+ * 分片上传
+ * @param param0
+ * @returns
+ */
+const uploadChunks = async ({
+  chunks,
+  existChunks,
+  fileHash,
+  fileName,
+}: UploadChunksProps) => {
+  const chunkInfoList = chunks.map((chunk, index) => ({
+    fileHash: fileHash,
+    chunkHash: `${fileHash}-${index}`,
+    chunk,
+  }));
+
+  const formDataList = chunkInfoList
+    .filter((item) => !existChunks.includes(item.chunkHash))
+    .map((item) => {
+      const formData = new FormData();
+      formData.append("fileHash", item.fileHash);
+      formData.append("chunkHash", item.chunkHash);
+      formData.append("chunk", item.chunk);
+      return formData;
+    });
+
+  if (formDataList.length !== 0) {
+    await uploadWithConcurrencyControl(formDataList);
+  }
+  if (abortFlag) {
+    abortFlag = false;
+    return Promise.reject("abort");
+  }
+  return mergeRequest(fileHash, fileName);
+};
+
+const FileUploader = () => {
+  /** 上传loading */
+  const [loading, setLoading] = useState(false);
+
+  /** 点击上传文件 */
+  const handleChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+      console.error("file is null");
+      return;
+    }
+    const fileName = file.name;
+    const chunks = createChunks(file);
+    const fileHash = await calculateHash(chunks);
+
+    const verifyRes = await verify(fileHash, fileName);
+
+    if (!verifyRes.data.shouldUpload) {
+      alert("秒传成功,文件已存在");
+      return;
+    }
+
+    setLoading(true);
+    abortControllers = [];
+    await uploadChunks({
+      chunks,
+      existChunks: verifyRes.data.existChunks,
+      fileHash,
+      fileName,
+    })
+      .then(() => {
+        alert("文件上传完成！");
+      })
+      .catch((e) => {
+        if (e === "abort") {
+          return;
+        }
+        throw e;
+      })
+      .finally(() => {
+        setLoading(false);
+      });
+  };
+
+  /** 用户中断请求 */
+  const abortUpload = () => {
+    if (!loading) return;
+    abortFlag = true;
+    for (const abort of abortControllers) {
+      abort.abort();
+    }
+    setLoading(false);
+    alert("上传已中断，下次可继续上传");
+  };
+
+  return (
+    <div>
+      <input onChange={handleChange} type="file" />
+      <button onClick={abortUpload} type="button">
+        中断请求
+      </button>
+    </div>
+  );
+};
+
+export default FileUploader;
+
+```
+
+## 后端代码
+
+后端使用hono框架，使用感受是真的很方便，尤其是内置了很多中间件不用安装而且对ts非常友好，写起来也比较快。总体感受就是比koa方便比express轻量。
+
+```ts
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import fse from "fs-extra";
+
+const app = new Hono();
+
+app.use("/api/*", cors());
+
+app.get("/", (c) => {
+  return c.text("Hello Hono!");
+});
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const UPLOAD_DIR = path.resolve(__dirname, "uploads");
+fse.ensureDir(UPLOAD_DIR);
+
+const extractExt = (fileName: string) => {
+  return fileName.slice(fileName.lastIndexOf("."));
+};
+
+interface RequestParams {
+  fileName: string;
+  fileHash: string;
+}
+
+interface ResponseData {
+  status?: number;
+  data: {
+    shouldUpload?: boolean;
+    existChunks?: string[];
+  };
+}
+
+/**
+ * 验证文件数据
+ */
+app.post("/api/verify", async (c) => {
+  const { fileName, fileHash } = await c.req.json<RequestParams>();
+
+  const completeFilePath = path.resolve(
+    UPLOAD_DIR,
+    `${fileHash}${extractExt(fileName)}`
+  );
+
+  if (fse.existsSync(completeFilePath)) {
+    return c.json<ResponseData>({
+      status: 200,
+      data: {
+        shouldUpload: false,
+      },
+    });
+  }
+
+  const chunkDir = path.resolve(UPLOAD_DIR, fileHash);
+  const existChunks = fse.existsSync(chunkDir)
+    ? await fse.readdir(chunkDir)
+    : [];
+
+  return c.json<ResponseData>({
+    data: {
+      existChunks,
+      shouldUpload: true,
+    },
+  });
+});
+
+/**
+ * 上传分片数据
+ */
+app.post("/api/upload", async (c) => {
+  const form = await c.req.formData();
+  const fileHash = form.get("fileHash") as string;
+  const chunkHash = form.get("chunkHash") as string;
+  const chunkFile = form.get("chunk") as File;
+
+  const chunkDir = path.resolve(UPLOAD_DIR, fileHash);
+  await fse.ensureDir(chunkDir);
+
+  const targetChunkPath = path.resolve(chunkDir, chunkHash);
+  await new Promise((res) => setTimeout(res, 2000));
+  const arrayBuffer = await chunkFile.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  await fse.writeFile(targetChunkPath, buffer);
+  return c.json({
+    status: 200,
+    message: "分片上传成功",
+  });
+});
+
+/** 合并文件 */
+app.post("/api/merge", async (c) => {
+  const { fileHash, fileName, size: CHUNK_SIZE } = await c.req.json();
+
+  const completeFilePath = path.resolve(
+    UPLOAD_DIR,
+    `${fileHash}${extractExt(fileName)}`
+  );
+
+  const chunkDir = path.resolve(UPLOAD_DIR, fileHash);
+
+  if (!fse.existsSync(chunkDir)) {
+    c.status(400);
+    return c.json({
+      status: 400,
+      message: "分片目录不存在",
+    });
+  }
+
+  const chunkPaths = await fse.readdir(chunkDir);
+  chunkPaths.sort(
+    (a, b) => parseInt(a.split("-")[1]) - parseInt(b.split("-")[1])
+  );
+
+  const mergePromises = chunkPaths.map((chunkName, index) => {
+    return new Promise((resolve, reject) => {
+      const chunkPath = path.resolve(chunkDir, chunkName);
+      const readStream = fse.createReadStream(chunkPath);
+      const writeStream = fse.createWriteStream(completeFilePath, {
+        start: index * CHUNK_SIZE,
+      });
+
+      readStream.on("end", async () => {
+        await fse.unlink(chunkPath);
+        resolve(true);
+      });
+
+      readStream.pipe(writeStream);
+    });
+  });
+
+  await Promise.all(mergePromises);
+
+  await fse.remove(chunkDir);
+
+  return c.json({
+    status: 200,
+    message: "文件合并成功",
+  });
+});
+
+serve(
+  {
+    fetch: app.fetch,
+    port: 3003,
+  },
+  (info) => {
+    console.log(`Server is running on http://localhost:${info.port}`);
+  }
+);
+
+```
